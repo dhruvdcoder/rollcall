@@ -19,14 +19,17 @@ LEVEL = logging.DEBUG
 # LEVEL = logging.INFO
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=LEVEL)
+    format="%(levelname)s -  file: %(pdf_name)s - page: %(pdf_page)s - %(message)s",
+    level=LEVEL)
+_logging_extra = {'pdf_name': "", "pdf_page": ""}
 
 
 def _set_filehandler(filename: str, mode: str = logging.DEBUG):
     fh = logging.FileHandler(filename)
     fh.setLevel(mode)
     form = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+        "%(levelname)s -  file: %(pdf_name)s - page: %(pdf_page)s - %(message)s"
+    )
     fh.setFormatter(form)
     logger.addHandler(fh)
 
@@ -39,7 +42,7 @@ class PDFEnd(PDFQueryException):
     pass
 
 
-p_date_line = r"(?:(?:in\s+der\s+([\d\w]+)\. Sitzung )|)am\s+(\w+)\s+den\s+(\d+)\.\s+(\w+)\s+(\d+)"  # noqa
+p_date_line = r"(?:(?:in\s+der\s+([\d\w]+)\. Sitzung )|)am\s+(\w+)\s+den\s+([\d\w]+)\.\s+(\w+)\s+([\d\w]+)"  # noqa
 r_date_line = re.compile(p_date_line)
 p_topic_end = r"Name"
 r_topic_end = re.compile(p_topic_end)
@@ -54,14 +57,14 @@ class Date:
 
     @classmethod
     def from_re_match(cls, m: re.Match):
-        logger.info("Creating Date object")
+        logger.info("Creating Date object", extra=_logging_extra)
         g: Tuple[str] = m.groups()
 
         if len(g) < 5:
             raise PDFQueryException(
                 "Number of groups ({}) not as expected ({})".format(len(g), 5))
         obj = cls(g[1], g[2], g[3], g[4])
-        logger.info(str(obj))
+        logger.info(str(obj), extra=_logging_extra)
 
         return obj
 
@@ -118,12 +121,12 @@ class MongoDB(Writer):
         col = self.client[self.db_name][self.collection_name]
         data = rc.asdict()
         key = data.pop('_id')
-        logger.info("Writing to mongodb {}".format(col))
+        logger.info("Writing to mongodb {}".format(col), extra=_logging_extra)
 
         res = col.update_one({'_id': key}, {'$set': data}, upsert=True)
 
         if not res.acknowledged:
-            logger.error("Could not write to mongodb")
+            logger.error("Could not write to mongodb", extra=_logging_extra)
 
 
 class XLWriter(object):
@@ -253,7 +256,7 @@ class Reader(object):
         return PDFQuery(self.filename)
 
     def setup_file(self, filename: str):
-        logger.info("Loading file {}".format(filename))
+        logger.info("Loading file {}".format(filename), extra=_logging_extra)
         self.filename = filename
         self.pdf = self.load_file()
         self.num_pages = get_number_of_pages(self.pdf)
@@ -290,9 +293,12 @@ class Reader(object):
                     _set_filehandler(err_file, logging.ERROR)
 
                     break
-        logger.info("Setting log file to {}".format(self.log_file.absolute()))
-        logger.info("Setting error file to {}".format(
-            self.err_file.absolute()))
+        logger.info(
+            "Setting log file to {}".format(self.log_file.absolute()),
+            extra=_logging_extra)
+        logger.info(
+            "Setting error file to {}".format(self.err_file.absolute()),
+            extra=_logging_extra)
 
         # if self.writer is not None:
         #    self.writer.add_sheet(filename)
@@ -303,14 +309,20 @@ class Reader(object):
         if self.current_page >= self.num_pages:
             raise PDFEnd("Reached end of pdf")
 
-        logger.debug("Current page: {}".format(self.current_page))
+        logger.debug(
+            "New page.",
+            extra={
+                "pdf_page": self.current_page + 1,
+                "pdf_name": self.filename
+            })
         # need to recreate the PDFQuery object
         # because simply calling load()
         # on the next page, keeps the
         # previous page in memory
 
         if self.current_page % self.flush_mem_after == 0:
-            logger.info("Releasing memory, reloading pdf")
+            logger.info(
+                "Releasing memory, reloading pdf", extra=_logging_extra)
             self.pdf = self.load_file()
         self.pdf.load(self.current_page)
 
@@ -330,7 +342,12 @@ class Reader(object):
             m = is_date(cursor.text())
 
             if m:
-                logger.info("Date found on page {}".format(self.current_page))
+                logger.info(
+                    "Date found",
+                    extra={
+                        "pdf_page": self.current_page + 1,
+                        "pdf_name": self.filename
+                    })
                 date = Date.from_re_match(m)
 
                 break
@@ -358,8 +375,11 @@ class Reader(object):
 
         if not date_found:
             logger.error(
-                "Date not found on page {} of {}. Extract should not have been called."
-                .format(self.current_page, self.filename))
+                "Date not found. Extract should not have been called.",
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
         # cursor is after date
         topic = []
         topic_ended = False
@@ -381,17 +401,30 @@ class Reader(object):
 
         if not topic_ended:
             # breakpoint()
-            err = "Topic on page {} of {} did not end in {} lines".format(
-                self.current_page, self.filename, self.max_topic_range)
-            logger.error(err)
-            logger.debug("Last line read for topic was : {}".format(t))
+            err = "Topic did not end in {} lines".format(self.current_page)
+            logger.error(
+                err,
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
+            logger.debug(
+                "Last line read for topic was : {}".format(t),
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
             # raise PDFQueryException(err)
 
         topic_str = ' '.join(topic)
 
         if not topic_str.strip():
-            logger.error("Registerd empty topic on page {} of {}".format(
-                self.filename))
+            logger.error(
+                "Registerd empty topic",
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
 
             return ""
         else:
@@ -412,28 +445,53 @@ class Reader(object):
         pq_obj = self.look_for_line()
 
         if not pq_obj:
-            logger.debug("No '{}' found on page {}".format(
-                self.look_for, self.current_page))
+            logger.debug(
+                "No '{}' found".format(self.look_for),
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
 
             return
-        logger.info("'{}' found on page {} ".format(self.look_for,
-                                                    self.current_page))
+        logger.info(
+            "'{}'".format(self.look_for),
+            extra={
+                "pdf_page": self.current_page + 1,
+                "pdf_name": self.filename
+            })
         date, m = self.check_next_few(pq_obj)
         expected_vol = self.matches_expected_bbox_volume(get_bbox(pq_obj))
 
         if expected_vol:
-            logger.debug("Bounding Box matches expected volume")
+            logger.debug(
+                "Bounding Box matches expected volume",
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
         else:
-            logger.debug("Bounding Box does not match expected vol")
+            logger.debug(
+                "Bounding Box does not match expected vol",
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
 
         if date is None:
-            logger.debug("No date after '{}' on page {}".format(
-                self.look_for, self.current_page))
+            logger.debug(
+                "No date after '{}'".format(self.look_for),
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
 
             if expected_vol:
                 logger.error(
-                    "Expeceted volume matches but could not find date on page {} of {}"
-                    .format(self.current_page, self.filename))
+                    "Expeceted volume matches but could not find date",
+                    extra={
+                        "pdf_page": self.current_page + 1,
+                        "pdf_name": self.filename
+                    })
 
             return
 
@@ -443,7 +501,12 @@ class Reader(object):
         bbox = get_bbox(pq_obj)
         rc = RollCall(meeting_number, date, self.current_page, topic,
                       Path(self.filename).name, bbox)
-        logger.info("Created {}".format(rc))
+        logger.info(
+            "Created {}".format(rc),
+            extra={
+                "pdf_page": self.current_page + 1,
+                "pdf_name": self.filename
+            })
         # write if writer is given
 
         if self.writer is not None:
@@ -452,16 +515,23 @@ class Reader(object):
 
     def read(self, filename: str):
         self.setup_file(filename)
-        logger.info("Reading file {}".format(filename))
+        logger.info(
+            "Reading file {}".format(self.filename), extra=_logging_extra)
         now = len(self.rollcalls)
 
         for page_no in self.page_iterator:
             self.next_page()
             self.process_page()
-        self.reset()
         final = len(self.rollcalls)
-        logger.info("{} roll call votes read from file {}".format(
-            final - now, filename))
+        logger.info(
+            "{} roll call votes read from file {}".format(
+                final - now, filename),
+            extra={
+                "pdf_page": self.current_page + 1,
+                "pdf_name": filename
+            })
+
+        self.reset()
 
         if self.writer:
             self.writer.close()
