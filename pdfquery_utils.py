@@ -1,4 +1,4 @@
-from typing import Optional, Union, Tuple, List, Dict
+from typing import Optional, Union, Tuple, List, Dict, Any
 import pdfquery as pq
 from pdfquery.cache import FileCache
 from pdfquery.pdfquery import PDFQuery
@@ -13,6 +13,7 @@ import xlsxwriter
 import json
 from pymongo import MongoClient
 import itertools
+import functools
 logger = logging.getLogger(__name__)
 
 LEVEL = logging.DEBUG
@@ -69,8 +70,21 @@ class Date:
         return obj
 
 
+class MongoDBWritable(object):
+    """ it should have id method which should add _id field"""
+
+    def id(self):
+        raise NotImplementedError
+
+    def asdict(self) -> Dict:
+        d = asdict(self)
+        d['_id'] = self.id()
+
+        return d
+
+
 @dataclass
-class RollCall(object):
+class RollCall(MongoDBWritable):
     number: Optional[int] = None
     date: Optional[Date] = None
     page: Optional[int] = None
@@ -92,15 +106,27 @@ class RollCall(object):
 
         return uuid
 
-    def asdict(self) -> Dict:
-        d = asdict(self)
-        d['_id'] = self.id()
 
-        return d
+@dataclass
+class NameData(MongoDBWritable):
+    full_name: Optional[str] = None
+    occupation: Optional[str] = None
+    constituency: Optional[str] = None
+    district: Optional[str] = None
+    party: Optional[str] = None
+    page: Optional[int] = None
+    filename: Optional[str] = None
+    match_number: Optional[int] = None
+
+    def id(self):
+        if self.full_name is None:
+            raise ValueError("Name cannot be None")
+
+        return self.full_name.strip()
 
 
 class Writer:
-    def write(self, rc: RollCall, **kwargs):
+    def write(self, rc: MongoDBWritable, **kwargs):
         raise NotImplementedError
 
     def close(self):
@@ -117,7 +143,7 @@ class MongoDB(Writer):
         self.db_name = db_name
         self.collection_name = collection_name
 
-    def write(self, rc: RollCall):
+    def write(self, rc: MongoDBWritable):
         col = self.client[self.db_name][self.collection_name]
         data = rc.asdict()
         key = data.pop('_id')
@@ -212,10 +238,22 @@ def get_number_of_pages(pdf: PDFQuery):
     return resolve1(pdf.doc.catalog['Pages'])['Count']
 
 
-def look_for_line(pdf: PDFQuery, line: str) -> PyQuery:
-    pq_obj = pdf.pq('LTTextLineHorizontal:contains("{}")'.format(line))
+def look_for_line(pdf: PDFQuery, line: str, regex=False) -> PyQuery:
+    if not regex:
+        pq_obj = pdf.pq('LTTextLineHorizontal:contains("{}")'.format(line))
+    else:
+        pq_obj = pdf.pq()
 
     return pq_obj
+
+
+class File(object):
+    def __init__(self, filename: str):
+        self.filename = Path(filename)
+        self.file = PDFQuery(self.filename)
+
+    def page(self, number: int) -> Any:
+        return self.file.load(number)
 
 
 class Reader(object):
@@ -260,9 +298,13 @@ class Reader(object):
         self.filename = filename
         self.pdf = self.load_file()
         self.num_pages = get_number_of_pages(self.pdf)
-        self.page_iterator = range(self.start_page, self.end_page
-                                   or self.num_pages)
-        self.current_page = -1
+        start_page = self.start_page
+        end_page = self.end_page or self.num_pages
+        logger.info(
+            "Page range : ({}, {})".format(start_page, end_page),
+            extra=_logging_extra)
+        self.page_iterator = range(start_page, end_page)
+        self.current_page = start_page - 1
         # setup log file
 
         if not self.log_file_set:
@@ -535,3 +577,161 @@ class Reader(object):
 
         if self.writer:
             self.writer.close()
+
+
+def _replace(inp: str, a: str, b: str):
+    return inp.replace(a, b)
+
+
+class PageTextReader(Reader):
+    """Converts each page into pure text"""
+
+    def __init__(self,
+                 check_next: int = 5,
+                 max_topic_range: int = 100,
+                 flush_mem_after: int = 5,
+                 start_page: int = 0,
+                 end_page: int = None,
+                 writer: Writer = None,
+                 log_file: Optional[str] = None,
+                 err_file: Optional[str] = None,
+                 replacements: List[Tuple[str, str]] = None):
+        super().__init__(
+            check_next=check_next,
+            max_topic_range=max_topic_range,
+            flush_mem_after=flush_mem_after,
+            start_page=start_page,
+            end_page=end_page,
+            writer=writer,
+            log_file=log_file,
+            err_file=err_file)
+        self.replacements = replacements or [('\xad', '')]
+
+    def process_page(self):
+        raise NotImplementedError
+
+    def get_page_text(self):
+        full_text = [
+            functools.reduce(
+                lambda s, repl_with: _replace(s, repl_with[0], repl_with[1]),
+                self.replacements, elem.text) for elem in self.pdf.pq(
+                    'LTTextBoxHorizontal, LTTextLineHorizontal')
+        ]
+
+        return '\n'.join(full_text)
+
+    def read(self, filename: str):
+        self.setup_file(filename)
+        logger.info(
+            "Reading file {}".format(self.filename), extra=_logging_extra)
+        now = len(self.rollcalls)
+
+        for page_no in self.page_iterator:
+            self.next_page()
+            self.process_page()
+        final = len(self.rollcalls)
+        logger.info(
+            "{} items read from file {}".format(final - now, filename),
+            extra={
+                "pdf_page": self.current_page + 1,
+                "pdf_name": filename
+            })
+
+        self.reset()
+
+        if self.writer:
+            self.writer.close()
+
+
+class NamesReader(PageTextReader):
+    names_pattern = r"^([^\n;\d]{1,200});([^—]{1,200})—([\s\w\n]{1,100})\."
+    occ_consti_dist = r"(.+)\s+(Wahlkr\.\s+\d+)(.+)"
+
+    @classmethod
+    def valid_name(cls, name: str) -> bool:
+        if ',' in name:
+            return True
+        else:
+            return False
+
+    def process_page(self):
+        # get the text
+        # breakpoint()
+        text = self.get_page_text()
+        # iterate over the matches
+        matches = re.finditer(self.names_pattern, text, re.MULTILINE)
+        matchNum = 0
+
+        for matchNum, match in enumerate(matches, start=1):
+            logger.debug(
+                "Match {matchNum} was found at {start}-{end}: {match}".format(
+                    matchNum=matchNum,
+                    start=match.start(),
+                    end=match.end(),
+                    match=match.group()),
+                extra={
+                    "pdf_page": self.current_page + 1,
+                    "pdf_name": self.filename
+                })
+            name = ' '.join(match.group(1).split())
+
+            if not self.valid_name(name):
+                logger.info(
+                    "{name} of match number {mn} not a valid name".format(
+                        name=name, mn=matchNum),
+                    extra={
+                        "pdf_page": self.current_page + 1,
+                        "pdf_name": self.filename
+                    })
+
+                continue
+
+            occupation_district = ' '.join(match.group(2).split())
+            m = re.match(self.occ_consti_dist, occupation_district)
+
+            if not m:
+                logger.error(
+                    "{occ_dist} not in '<occupation> Wahlkr. <number> (<district>)' form"
+                    .format(occ_dist=occupation_district),
+                    extra={
+                        "pdf_page": self.current_page + 1,
+                        "pdf_name": self.filename
+                    })
+                occ = occupation_district
+                consti = ''
+                dist = ''
+            else:
+                try:
+                    occ = m.group(1)
+                    consti = m.group(2)
+                    dist = m.group(3)
+                except IndexError as ie:
+                    logger.error(
+                        "Occupation district regex groups don't match",
+                        extra={
+                            "pdf_page": self.current_page + 1,
+                            "pdf_name": self.filename
+                        })
+                    occ = occupation_district
+                    consti = ''
+                    dist = ''
+
+            party = ' '.join(match.group(3).split())
+
+            data_instance = NameData(
+                full_name=name,
+                occupation=occ,
+                constituency=consti,
+                district=dist,
+                party=party,
+                page=self.current_page,
+                filename=self.filename,
+                match_number=matchNum)
+            self.rollcalls.append(data_instance)
+            self.writer.write(data_instance)
+        logger.info(
+            "Found {} names on this page.".format(matchNum),
+            extra={
+                "pdf_page": self.current_page + 1,
+                "pdf_name": self.filename
+            })
